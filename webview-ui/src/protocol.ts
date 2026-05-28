@@ -45,7 +45,19 @@ export interface PromptImage {
   data: string;
 }
 
+export interface FolderInfo {
+  /** Absolute fsPath of the workspace folder — the routing key. */
+  path: string;
+  /** Display name (folder basename). */
+  name: string;
+}
+
+/**
+ * Item-mutating host messages carry an optional `folder` so the webview can
+ * route them to the right per-folder history. Absent means the active folder.
+ */
 export type HostMessage =
+  | { type: 'folders'; folders: FolderInfo[]; active: string }
   | { type: 'user'; text: string; images?: PromptImage[] }
   | { type: 'chunk'; text: string }
   | { type: 'thought'; text: string }
@@ -74,6 +86,7 @@ export type WebviewMessage =
   | { type: 'prompt'; text: string; mentions?: string[]; images?: PromptImage[] }
   | { type: 'cancel' }
   | { type: 'restart' }
+  | { type: 'select_folder'; folder: string }
   | { type: 'search_files'; requestId: number; query: string }
   | { type: 'permission_response'; id: string; optionId: string | null }
   | { type: 'question_response'; id: string; answers: AskAnswer[] | null };

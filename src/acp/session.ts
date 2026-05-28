@@ -173,3 +173,10 @@ export class SudocodeSession {
 export function getWorkspaceCwd(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 }
+
+export function getWorkspaceFolders(): Array<{ path: string; name: string }> {
+  return (vscode.workspace.workspaceFolders ?? []).map((f) => ({
+    path: f.uri.fsPath,
+    name: f.name,
+  }));
+}

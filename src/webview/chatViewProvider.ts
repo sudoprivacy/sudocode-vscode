@@ -1,8 +1,9 @@
 import { readdirSync } from 'node:fs';
+import path from 'node:path';
 import * as vscode from 'vscode';
 import type * as schema from '@agentclientprotocol/sdk';
 import {
-  getWorkspaceCwd,
+  getWorkspaceFolders,
   SudocodeSession,
   type AskAnswer,
   type AskQuestion,
@@ -15,10 +16,12 @@ type PermissionMode = 'default' | 'read-only' | 'workspace-write' | 'danger-full
 
 interface PendingPermission {
   resolve(value: { optionId: string | null }): void;
+  folder: string;
 }
 
 interface PendingQuestion {
   resolve(value: { answers: AskAnswer[] | null }): void;
+  folder: string;
 }
 
 /** Extract as much detail as possible from a thrown value (JSON-RPC errors carry code/data). */
@@ -55,12 +58,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'sudocode.chatView';
 
   private view?: vscode.WebviewView;
-  private session?: SudocodeSession;
+  private sessions = new Map<string, SudocodeSession>();
+  private activeFolder?: string;
   private pendingPermissions = new Map<string, PendingPermission>();
   private permissionCounter = 0;
   private pendingQuestions = new Map<string, PendingQuestion>();
   private questionCounter = 0;
   private shownHints = new Set<string>();
+  private disposables: vscode.Disposable[] = [];
 
   constructor(private readonly extensionUri: vscode.Uri) {}
 
@@ -83,16 +88,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         images?: PromptImage[];
         requestId?: number;
         query?: string;
+        folder?: string;
       }) => {
         if (msg.type === 'prompt' && msg.text !== undefined) {
           await this.handlePrompt(msg.text, msg.mentions ?? [], msg.images ?? []);
         } else if (msg.type === 'cancel') {
-          if (this.session) {
-            this.post({ type: 'status', text: 'Cancel requested…' });
-            await this.session.cancel();
+          const session = this.activeFolder ? this.sessions.get(this.activeFolder) : undefined;
+          if (session) {
+            this.post({ type: 'status', text: 'Cancel requested…' }, this.activeFolder);
+            await session.cancel();
           }
         } else if (msg.type === 'restart') {
           await this.restart();
+        } else if (msg.type === 'select_folder' && msg.folder) {
+          this.activeFolder = msg.folder;
         } else if (msg.type === 'search_files' && typeof msg.requestId === 'number') {
           await this.searchFiles(msg.requestId, msg.query ?? '');
         } else if (msg.type === 'permission_response' && msg.id) {
@@ -111,20 +120,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       },
     );
 
+    this.disposables.push(
+      vscode.workspace.onDidChangeWorkspaceFolders(() => this.syncFolders()),
+    );
+
     webviewView.onDidDispose(() => {
       this.resolveAllPending(null);
-      this.session?.dispose();
-      this.session = undefined;
+      for (const s of this.sessions.values()) s.dispose();
+      this.sessions.clear();
+      for (const d of this.disposables) d.dispose();
+      this.disposables = [];
     });
+
+    this.syncFolders();
+  }
+
+  /** Push the current workspace-folder list to the webview, picking a default active folder. */
+  private syncFolders(): void {
+    const folders = getWorkspaceFolders();
+    const known = new Set(folders.map((f) => f.path));
+    // Drop sessions for folders that no longer exist.
+    for (const [folder, session] of this.sessions) {
+      if (!known.has(folder)) {
+        session.dispose();
+        this.sessions.delete(folder);
+      }
+    }
+    if (!this.activeFolder || !known.has(this.activeFolder)) {
+      this.activeFolder = folders[0]?.path;
+    }
+    this.post({ type: 'folders', folders, active: this.activeFolder ?? '' });
   }
 
   async restart(): Promise<void> {
-    this.resolveAllPending(null);
-    this.session?.dispose();
-    this.session = undefined;
+    const folder = this.activeFolder;
+    this.resolveAllPending(null, folder);
+    if (folder) {
+      this.sessions.get(folder)?.dispose();
+      this.sessions.delete(folder);
+    }
     this.shownHints.clear();
-    this.post({ type: 'reset' });
-    this.post({ type: 'status', text: 'Agent restarted.' });
+    this.post({ type: 'reset' }, folder);
+    this.post({ type: 'status', text: 'Agent restarted.' }, folder);
   }
 
   /** Insert a markdown snippet into the chat input and focus the panel. */
@@ -133,35 +170,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'prefill', text });
   }
 
-  private async ensureSession(): Promise<SudocodeSession> {
-    if (this.session) return this.session;
-
-    const cwd = getWorkspaceCwd();
-    if (!cwd) {
-      throw new Error('Sudocode 需要先在 VS Code 里打开一个工作区文件夹（File > Open Folder…），它会作为 agent 的工作目录。');
-    }
+  private async ensureSession(folder: string): Promise<SudocodeSession> {
+    const existing = this.sessions.get(folder);
+    if (existing) return existing;
 
     const cfg = vscode.workspace.getConfiguration('sudocode');
     const session = new SudocodeSession(
-      cwd,
+      folder,
       {
-        onUpdate: (u) => this.handleUpdate(u),
+        onUpdate: (u) => this.handleUpdate(folder, u),
         onExit: ({ code, signal }) => {
-          this.resolveAllPending(null);
-          this.post({ type: 'status', text: `Agent exited (code=${code}, signal=${signal}).` });
-          this.session = undefined;
+          this.resolveAllPending(null, folder);
+          this.post({ type: 'status', text: `Agent exited (code=${code}, signal=${signal}).` }, folder);
+          this.sessions.delete(folder);
         },
         onStderr: (line) => {
           console.error('[scode]', line);
-          this.post({ type: 'stderr', text: line });
+          this.post({ type: 'stderr', text: line }, folder);
           const hint = translateStderrHint(line);
           if (hint && !this.shownHints.has(hint)) {
             this.shownHints.add(hint);
-            this.post({ type: 'error', text: hint });
+            this.post({ type: 'error', text: hint }, folder);
           }
         },
-        onRequestPermission: (req) => this.requestPermission(req),
-        onAskQuestions: (questions) => this.askQuestions(questions),
+        onRequestPermission: (req) => this.requestPermission(folder, req),
+        onAskQuestions: (questions) => this.askQuestions(folder, questions),
       },
       { cliPath: cfg.get<string>('cliPath') || undefined,
         authMode: cfg.get<AuthMode>('authMode') ?? 'auto',
@@ -171,50 +204,62 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       },
     );
     await session.start();
-    this.session = session;
+    this.sessions.set(folder, session);
     return session;
   }
 
   private async handlePrompt(text: string, mentions: string[] = [], images: PromptImage[] = []): Promise<void> {
-    this.post({ type: 'user', text, images: images.length > 0 ? images : undefined });
+    const folder = this.activeFolder;
+    if (!folder) {
+      this.post({
+        type: 'error',
+        text: 'Sudocode 需要先在 VS Code 里打开一个工作区文件夹（File > Open Folder…），它会作为 agent 的工作目录。',
+      });
+      return;
+    }
+    this.post({ type: 'user', text, images: images.length > 0 ? images : undefined }, folder);
     let phase = 'start';
     try {
-      const session = await this.ensureSession();
+      const session = await this.ensureSession(folder);
       phase = 'prompt';
       if (images.length > 0 && !session.supportsImages) {
         this.post({
           type: 'status',
           text: 'This agent did not advertise image support; pasted images were not sent.',
-        });
+        }, folder);
       }
       const result = await session.prompt(text, mentions, images);
-      this.post({ type: 'done', text: result.stopReason });
+      this.post({ type: 'done', text: result.stopReason }, folder);
     } catch (err) {
-      this.post({ type: 'error', text: `[${phase}] ${describeError(err)}` });
+      this.post({ type: 'error', text: `[${phase}] ${describeError(err)}` }, folder);
     }
   }
 
-  /** Fuzzy-ish file search for @-mentions. Returns workspace-relative paths. */
+  /** Fuzzy-ish file search for @-mentions, scoped to the active folder. */
   private async searchFiles(requestId: number, query: string): Promise<void> {
+    const folder = this.activeFolder;
     let files: string[] = [];
     try {
       const glob = query ? `**/*${query.replace(/[\\]/g, '/')}*` : '**/*';
-      const uris = await vscode.workspace.findFiles(glob, '**/{node_modules,.git,dist,out}/**', 30);
-      files = uris.map((u) => vscode.workspace.asRelativePath(u, false)).sort((a, b) => a.length - b.length);
+      const include = folder ? new vscode.RelativePattern(vscode.Uri.file(folder), glob) : glob;
+      const uris = await vscode.workspace.findFiles(include, '**/{node_modules,.git,dist,out}/**', 30);
+      files = uris
+        .map((u) => (folder ? path.relative(folder, u.fsPath) : vscode.workspace.asRelativePath(u, false)))
+        .sort((a, b) => a.length - b.length);
     } catch {
       files = [];
     }
     this.post({ type: 'file_results', requestId, query, files });
   }
 
-  private handleUpdate(params: schema.SessionNotification): void {
+  private handleUpdate(folder: string, params: schema.SessionNotification): void {
     const update = params.update;
     switch (update.sessionUpdate) {
       case 'agent_message_chunk':
-        if (update.content.type === 'text') this.post({ type: 'chunk', text: update.content.text });
+        if (update.content.type === 'text') this.post({ type: 'chunk', text: update.content.text }, folder);
         break;
       case 'agent_thought_chunk':
-        if (update.content.type === 'text') this.post({ type: 'thought', text: update.content.text });
+        if (update.content.type === 'text') this.post({ type: 'thought', text: update.content.text }, folder);
         break;
       case 'tool_call':
         this.post({
@@ -229,7 +274,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             content: update.content,
             locations: update.locations,
           },
-        });
+        }, folder);
         break;
       case 'tool_call_update': {
         const patch: Record<string, unknown> = {};
@@ -240,55 +285,57 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (update.rawOutput !== undefined) patch.rawOutput = update.rawOutput;
         if (update.content != null) patch.content = update.content;
         if (update.locations != null) patch.locations = update.locations;
-        this.post({ type: 'tool_update', toolCallId: update.toolCallId, patch });
+        this.post({ type: 'tool_update', toolCallId: update.toolCallId, patch }, folder);
         break;
       }
       case 'plan':
-        this.post({ type: 'plan', entries: update.entries });
+        this.post({ type: 'plan', entries: update.entries }, folder);
         break;
       default:
         break;
     }
   }
 
-  private post(message: Record<string, unknown>): void {
-    this.view?.webview.postMessage(message);
+  private post(message: Record<string, unknown>, folder?: string): void {
+    this.view?.webview.postMessage(folder ? { ...message, folder } : message);
   }
 
-  private requestPermission(req: PermissionRequest): Promise<{ optionId: string | null }> {
+  private requestPermission(folder: string, req: PermissionRequest): Promise<{ optionId: string | null }> {
     this.view?.show?.(true);
     const id = `p${++this.permissionCounter}`;
     return new Promise<{ optionId: string | null }>((resolve) => {
-      this.pendingPermissions.set(id, { resolve });
+      this.pendingPermissions.set(id, { resolve, folder });
       this.post({
         type: 'permission_request',
         id,
         toolTitle: req.toolTitle,
         toolKind: req.toolKind,
         options: req.options,
-      });
+      }, folder);
     });
   }
 
-  private resolveAllPending(optionId: string | null): void {
+  private resolveAllPending(optionId: string | null, folder?: string): void {
     for (const [id, p] of this.pendingPermissions) {
-      this.post({ type: 'permission_resolved', id, optionId });
+      if (folder && p.folder !== folder) continue;
+      this.post({ type: 'permission_resolved', id, optionId }, p.folder);
       p.resolve({ optionId });
+      this.pendingPermissions.delete(id);
     }
-    this.pendingPermissions.clear();
     for (const [id, p] of this.pendingQuestions) {
-      this.post({ type: 'question_resolved', id });
+      if (folder && p.folder !== folder) continue;
+      this.post({ type: 'question_resolved', id }, p.folder);
       p.resolve({ answers: null });
+      this.pendingQuestions.delete(id);
     }
-    this.pendingQuestions.clear();
   }
 
-  private askQuestions(questions: AskQuestion[]): Promise<{ answers: AskAnswer[] | null }> {
+  private askQuestions(folder: string, questions: AskQuestion[]): Promise<{ answers: AskAnswer[] | null }> {
     this.view?.show?.(true);
     const id = `q${++this.questionCounter}`;
     return new Promise<{ answers: AskAnswer[] | null }>((resolve) => {
-      this.pendingQuestions.set(id, { resolve });
-      this.post({ type: 'question_request', id, questions });
+      this.pendingQuestions.set(id, { resolve, folder });
+      this.post({ type: 'question_request', id, questions }, folder);
     });
   }
 

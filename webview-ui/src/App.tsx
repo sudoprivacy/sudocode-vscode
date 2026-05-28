@@ -1,5 +1,5 @@
-import React, { useEffect, useReducer, useRef, useState } from 'react';
-import type { AskAnswer, HostMessage, PromptImage } from './protocol';
+import React, { useEffect, useRef, useState } from 'react';
+import type { AskAnswer, FolderInfo, HostMessage, PromptImage } from './protocol';
 import { bumpIdCounter, reduce, type Item } from './reducer';
 import { Markdown } from './components/Markdown';
 import { ToolCard } from './components/ToolCard';
@@ -9,52 +9,117 @@ import { ChatInput, type ChatInputHandle } from './components/ChatInput';
 const vscode = acquireVsCodeApi();
 
 interface PersistedState {
-  items: Item[];
-  input: string;
+  itemsByFolder: Record<string, Item[]>;
+  inputByFolder: Record<string, string>;
+  activeFolder: string;
+  /** Legacy single-folder shape from older builds. */
+  items?: Item[];
+  input?: string;
 }
 
-function loadState(): PersistedState {
+interface LoadedState {
+  itemsByFolder: Record<string, Item[]>;
+  inputByFolder: Record<string, string>;
+  activeFolder: string;
+  legacyItems: Item[];
+}
+
+function loadState(): LoadedState {
   const raw = vscode.getState<PersistedState>();
+  if (raw && raw.itemsByFolder && typeof raw.itemsByFolder === 'object') {
+    for (const list of Object.values(raw.itemsByFolder)) bumpIdCounter(list);
+    return {
+      itemsByFolder: raw.itemsByFolder,
+      inputByFolder: raw.inputByFolder ?? {},
+      activeFolder: typeof raw.activeFolder === 'string' ? raw.activeFolder : '',
+      legacyItems: [],
+    };
+  }
+  // Migrate legacy { items, input } — assigned to the active folder once known.
   if (raw && Array.isArray(raw.items)) {
     bumpIdCounter(raw.items);
-    return { items: raw.items, input: typeof raw.input === 'string' ? raw.input : '' };
+    return {
+      itemsByFolder: {},
+      inputByFolder: {},
+      activeFolder: '',
+      legacyItems: raw.items,
+    };
   }
-  return { items: [], input: '' };
+  return { itemsByFolder: {}, inputByFolder: {}, activeFolder: '', legacyItems: [] };
 }
 
 const initial = loadState();
 
 export function App(): React.ReactElement {
-  const [items, dispatch] = useReducer(reduce, initial.items);
-  const [busy, setBusy] = useState(false);
-  const [input, setInput] = useState(initial.input);
+  const [folders, setFolders] = useState<FolderInfo[]>([]);
+  const [activeFolder, setActiveFolder] = useState<string>(initial.activeFolder);
+  const [itemsByFolder, setItemsByFolder] = useState<Record<string, Item[]>>(initial.itemsByFolder);
+  const [inputByFolder, setInputByFolder] = useState<Record<string, string>>(initial.inputByFolder);
+  const [busyByFolder, setBusyByFolder] = useState<Record<string, boolean>>({});
   const [mentionResults, setMentionResults] = useState<{ query: string; files: string[] } | null>(null);
   const [images, setImages] = useState<PromptImage[]>([]);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<ChatInputHandle>(null);
   const searchSeq = useRef(0);
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeFolderRef = useRef(activeFolder);
+  const legacyRef = useRef(initial.legacyItems);
+  activeFolderRef.current = activeFolder;
+
+  const items = itemsByFolder[activeFolder] ?? [];
+  const input = inputByFolder[activeFolder] ?? '';
+  const busy = busyByFolder[activeFolder] ?? false;
 
   useEffect(() => {
-    vscode.setState<PersistedState>({ items, input });
-  }, [items, input]);
+    vscode.setState<PersistedState>({ itemsByFolder, inputByFolder, activeFolder });
+  }, [itemsByFolder, inputByFolder, activeFolder]);
+
+  function applyToFolder(folder: string, msg: HostMessage) {
+    setItemsByFolder((prev) => ({ ...prev, [folder]: reduce(prev[folder] ?? [], msg) }));
+  }
+
+  function setActiveInput(text: string) {
+    setInputByFolder((prev) => ({ ...prev, [activeFolderRef.current]: text }));
+  }
 
   useEffect(() => {
-    if (initial.items.length > 0) {
-      dispatch({
-        type: 'status',
-        text: '(Restored from previous webview state — the agent process was reset, so the model will not remember this conversation.)',
-      });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    function onMessage(event: MessageEvent<HostMessage>) {
+    function onMessage(event: MessageEvent<HostMessage & { folder?: string }>) {
       const msg = event.data;
       if (!msg || typeof msg !== 'object') return;
+
+      if (msg.type === 'folders') {
+        setFolders(msg.folders);
+        const known = new Set(msg.folders.map((f) => f.path));
+        const current = activeFolderRef.current;
+        const effective = current && known.has(current) ? current : msg.active;
+        if (effective !== current) {
+          setActiveFolder(effective);
+          activeFolderRef.current = effective;
+        }
+        // Tell the host which folder is active so prompt routing agrees.
+        if (effective) vscode.postMessage({ type: 'select_folder', folder: effective });
+        // Migrate legacy history into the effective folder on first connect.
+        if (legacyRef.current.length > 0 && effective) {
+          const legacy = legacyRef.current;
+          legacyRef.current = [];
+          setItemsByFolder((prev) => {
+            if ((prev[effective] ?? []).length > 0) return prev;
+            return { ...prev, [effective]: legacy };
+          });
+          applyToFolder(effective, {
+            type: 'status',
+            text: '(Restored from previous webview state — the agent process was reset, so the model will not remember this conversation.)',
+          });
+        }
+        return;
+      }
+
       if (msg.type === 'prefill') {
-        setInput((prev) => (prev ? prev + '\n\n' + msg.text : msg.text));
+        const f = activeFolderRef.current;
+        setInputByFolder((prev) => {
+          const cur = prev[f] ?? '';
+          return { ...prev, [f]: cur ? cur + '\n\n' + msg.text : msg.text };
+        });
         setTimeout(() => inputRef.current?.focus(), 0);
         return;
       }
@@ -65,17 +130,33 @@ export function App(): React.ReactElement {
         }
         return;
       }
-      dispatch(msg);
-      if (msg.type === 'done' || msg.type === 'error') setBusy(false);
+
+      const folder = msg.folder ?? activeFolderRef.current;
+      if (!folder) return;
+      applyToFolder(folder, msg);
+      if (msg.type === 'done' || msg.type === 'error') {
+        setBusyByFolder((prev) => ({ ...prev, [folder]: false }));
+      }
     }
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     const el = scrollerRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [items]);
+
+  function selectFolder(folder: string) {
+    if (folder === activeFolder) return;
+    setActiveFolder(folder);
+    activeFolderRef.current = folder;
+    setImages([]);
+    setMentionResults(null);
+    vscode.postMessage({ type: 'select_folder', folder });
+    setTimeout(() => inputRef.current?.focus(), 0);
+  }
 
   function onMentionQuery(query: string | null) {
     if (searchTimer.current) clearTimeout(searchTimer.current);
@@ -90,8 +171,9 @@ export function App(): React.ReactElement {
   }
 
   function onSend(text: string) {
-    setBusy(true);
-    setInput('');
+    const folder = activeFolder;
+    setBusyByFolder((prev) => ({ ...prev, [folder]: true }));
+    setActiveInput('');
     setMentionResults(null);
     const mentions = parseMentions(text);
     const imgs = images;
@@ -109,7 +191,7 @@ export function App(): React.ReactElement {
       return;
     }
     if (name === 'help') {
-      dispatch({
+      applyToFolder(activeFolder, {
         type: 'status',
         text:
           'Sudocode commands: /clear to reset chat & restart agent · /help to show this message · /compact /cost /model are forwarded to scode. Settings: search "sudocode" in VS Code settings to change permission mode, model, CLI path.',
@@ -119,16 +201,33 @@ export function App(): React.ReactElement {
 
   function onPermissionChoice(requestId: string, optionId: string | null) {
     vscode.postMessage({ type: 'permission_response', id: requestId, optionId });
-    dispatch({ type: 'permission_resolved', id: requestId, optionId });
+    applyToFolder(activeFolder, { type: 'permission_resolved', id: requestId, optionId });
   }
 
   function onQuestionSubmit(requestId: string, answers: AskAnswer[] | null) {
     vscode.postMessage({ type: 'question_response', id: requestId, answers });
-    dispatch({ type: 'question_resolved', id: requestId });
+    applyToFolder(activeFolder, { type: 'question_resolved', id: requestId });
   }
 
   return (
     <div className="app">
+      {folders.length > 1 && (
+        <div className="folder-bar">
+          <select
+            className="folder-select"
+            value={activeFolder}
+            onChange={(e) => selectFolder(e.target.value)}
+            title="Workspace folder"
+          >
+            {folders.map((f) => (
+              <option key={f.path} value={f.path}>
+                {f.name}
+                {(busyByFolder[f.path] ?? false) ? ' ●' : ''}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
       <div className="log" ref={scrollerRef}>
         {items.length === 0 && (
           <div className="hint">Type a message below to start.</div>
@@ -138,7 +237,7 @@ export function App(): React.ReactElement {
       <ChatInput
         ref={inputRef}
         value={input}
-        onChange={setInput}
+        onChange={setActiveInput}
         onSend={onSend}
         onCancel={onCancel}
         onLocalCommand={onLocalCommand}
