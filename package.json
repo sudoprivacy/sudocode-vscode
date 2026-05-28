@@ -1,0 +1,165 @@
+{
+  "name": "sudocode-vscode",
+  "displayName": "Sudocode",
+  "description": "Sudocode AI coding agent for VS Code (ACP)",
+  "version": "0.1.0",
+  "publisher": "sudoprivacy",
+  "license": "ISC",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sudoprivacy/sudocode-vscode"
+  },
+  "bugs": {
+    "url": "https://github.com/sudoprivacy/sudocode-vscode/issues"
+  },
+  "homepage": "https://sudocode.dev",
+  "keywords": [
+    "ai",
+    "agent",
+    "chat",
+    "coding-assistant",
+    "acp",
+    "sudocode",
+    "scode",
+    "claude"
+  ],
+  "galleryBanner": {
+    "color": "#1f1f1f",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "type": "commonjs",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "sudocode",
+          "title": "Sudocode",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "sudocode": [
+        {
+          "id": "sudocode.chatView",
+          "name": "Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "sudocode.restart",
+        "title": "Sudocode: Restart Agent"
+      },
+      {
+        "command": "sudocode.sendSelection",
+        "title": "Sudocode: Send Selection to Chat"
+      },
+      {
+        "command": "sudocode.sendFile",
+        "title": "Sudocode: Send File to Chat"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "sudocode.sendSelection",
+          "when": "editorHasSelection",
+          "group": "sudocode@1"
+        },
+        {
+          "command": "sudocode.sendFile",
+          "when": "editorTextFocus",
+          "group": "sudocode@2"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "sudocode.sendSelection",
+        "key": "ctrl+alt+l",
+        "mac": "cmd+alt+l",
+        "when": "editorTextFocus && editorHasSelection"
+      }
+    ],
+    "configuration": {
+      "title": "Sudocode",
+      "properties": {
+        "sudocode.cliPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the scode binary. Leave empty to auto-detect (~/.nexus/sudocode/scode, then PATH)."
+        },
+        "sudocode.authMode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "subscription",
+            "proxy",
+            "api-key"
+          ],
+          "default": "auto",
+          "description": "Auth mode passed to scode. 'auto' lets scode/env decide."
+        },
+        "sudocode.permissionMode": {
+          "type": "string",
+          "enum": [
+            "default",
+            "read-only",
+            "workspace-write",
+            "danger-full-access"
+          ],
+          "default": "default",
+          "markdownDescription": "Permission mode passed to scode via `--permission-mode`. `default` leaves it unset (scode picks its own default — currently `danger-full-access`). Use `workspace-write` to require approval for actions outside the workspace, or `read-only` to disallow writes."
+        },
+        "sudocode.model": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Override the scode model (e.g. `opus`, `sonnet`, `anthropic/claude-opus-4-6`). Empty = use scode's configured default."
+        },
+        "sudocode.extraArgs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "markdownDescription": "Extra arguments appended before `acp` when spawning scode. Use for flags not yet exposed as settings (e.g. `--reasoning-effort`, `--allowedTools`)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build:webview": "npm --prefix webview-ui run build",
+    "build:ext": "node esbuild.js",
+    "build": "npm run build:webview && npm run build:ext",
+    "watch:webview": "npm --prefix webview-ui run watch",
+    "watch:ext": "node esbuild.js --watch",
+    "watch": "npm-run-all --parallel watch:webview watch:ext",
+    "vscode:prepublish": "npm run build:webview && node esbuild.js --production",
+    "typecheck": "tsc --noEmit && npm --prefix webview-ui run typecheck",
+    "test": "npm --prefix webview-ui run test",
+    "postinstall": "npm --prefix webview-ui install"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^0.22.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "@types/vscode": "^1.120.0",
+    "esbuild": "^0.28.0",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^6.0.3"
+  }
+}
