@@ -1,8 +1,9 @@
 import React, { useEffect, useReducer, useRef, useState } from 'react';
-import type { HostMessage } from './protocol';
+import type { AskAnswer, HostMessage, PromptImage } from './protocol';
 import { bumpIdCounter, reduce, type Item } from './reducer';
 import { Markdown } from './components/Markdown';
 import { ToolCard } from './components/ToolCard';
+import { QuestionCard } from './components/QuestionCard';
 import { ChatInput, type ChatInputHandle } from './components/ChatInput';
 
 const vscode = acquireVsCodeApi();
@@ -27,8 +28,12 @@ export function App(): React.ReactElement {
   const [items, dispatch] = useReducer(reduce, initial.items);
   const [busy, setBusy] = useState(false);
   const [input, setInput] = useState(initial.input);
+  const [mentionResults, setMentionResults] = useState<{ query: string; files: string[] } | null>(null);
+  const [images, setImages] = useState<PromptImage[]>([]);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<ChatInputHandle>(null);
+  const searchSeq = useRef(0);
+  const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     vscode.setState<PersistedState>({ items, input });
@@ -53,6 +58,13 @@ export function App(): React.ReactElement {
         setTimeout(() => inputRef.current?.focus(), 0);
         return;
       }
+      if (msg.type === 'file_results') {
+        // Only honor the most recent request to avoid stale menus.
+        if (msg.requestId === searchSeq.current) {
+          setMentionResults({ query: msg.query, files: msg.files });
+        }
+        return;
+      }
       dispatch(msg);
       if (msg.type === 'done' || msg.type === 'error') setBusy(false);
     }
@@ -65,10 +77,26 @@ export function App(): React.ReactElement {
     if (el) el.scrollTop = el.scrollHeight;
   }, [items]);
 
+  function onMentionQuery(query: string | null) {
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    if (query === null) {
+      setMentionResults(null);
+      return;
+    }
+    searchTimer.current = setTimeout(() => {
+      const requestId = ++searchSeq.current;
+      vscode.postMessage({ type: 'search_files', requestId, query });
+    }, 120);
+  }
+
   function onSend(text: string) {
     setBusy(true);
     setInput('');
-    vscode.postMessage({ type: 'prompt', text });
+    setMentionResults(null);
+    const mentions = parseMentions(text);
+    const imgs = images;
+    setImages([]);
+    vscode.postMessage({ type: 'prompt', text, mentions, images: imgs.length > 0 ? imgs : undefined });
   }
 
   function onCancel() {
@@ -94,13 +122,18 @@ export function App(): React.ReactElement {
     dispatch({ type: 'permission_resolved', id: requestId, optionId });
   }
 
+  function onQuestionSubmit(requestId: string, answers: AskAnswer[] | null) {
+    vscode.postMessage({ type: 'question_response', id: requestId, answers });
+    dispatch({ type: 'question_resolved', id: requestId });
+  }
+
   return (
     <div className="app">
       <div className="log" ref={scrollerRef}>
         {items.length === 0 && (
           <div className="hint">Type a message below to start.</div>
         )}
-        {items.map((item) => renderItem(item, onPermissionChoice))}
+        {items.map((item) => renderItem(item, onPermissionChoice, onQuestionSubmit))}
       </div>
       <ChatInput
         ref={inputRef}
@@ -109,21 +142,48 @@ export function App(): React.ReactElement {
         onSend={onSend}
         onCancel={onCancel}
         onLocalCommand={onLocalCommand}
+        onMentionQuery={onMentionQuery}
+        mentionResults={mentionResults}
+        images={images}
+        onAddImages={(imgs) => setImages((prev) => [...prev, ...imgs])}
+        onRemoveImage={(idx) => setImages((prev) => prev.filter((_, i) => i !== idx))}
         busy={busy}
       />
     </div>
   );
 }
 
+/** Pull @-mention path tokens out of the message text. */
+function parseMentions(text: string): string[] {
+  const out = new Set<string>();
+  const re = /(?:^|\s)@(\S+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const token = m[1].replace(/[.,;:]+$/, '');
+    if (token) out.add(token);
+  }
+  return [...out];
+}
+
 function renderItem(
   item: Item,
   onPermissionChoice: (requestId: string, optionId: string | null) => void,
+  onQuestionSubmit: (requestId: string, answers: AskAnswer[] | null) => void,
 ): React.ReactElement {
   switch (item.kind) {
     case 'user':
       return (
         <div key={item.id} className="item user">
-          <Markdown text={item.text} />
+          {item.text && <Markdown text={item.text} />}
+          {item.images && item.images.length > 0 && (
+            <div className="image-strip">
+              {item.images.map((img, i) => (
+                <div key={i} className="image-thumb">
+                  <img src={`data:${img.mimeType};base64,${img.data}`} alt={`attachment ${i + 1}`} />
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       );
     case 'agent':
@@ -220,5 +280,16 @@ function renderItem(
         </div>
       );
     }
+    case 'question':
+      return (
+        <div key={item.id} className="item question">
+          <QuestionCard
+            questions={item.questions}
+            resolved={item.resolved ?? false}
+            onSubmit={(answers) => onQuestionSubmit(item.requestId, answers)}
+            onCancel={() => onQuestionSubmit(item.requestId, null)}
+          />
+        </div>
+      );
   }
 }

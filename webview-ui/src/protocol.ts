@@ -23,8 +23,30 @@ export interface PermissionOption {
   kind?: 'allow_once' | 'allow_always' | 'reject_once' | 'reject_always' | string;
 }
 
+export interface AskQuestion {
+  id: string;
+  prompt: string;
+  kind?: 'single_select' | 'multi_select' | 'text' | 'boolean';
+  required?: boolean;
+  allowCustomInput?: boolean;
+  customInputHint?: string;
+  options?: Array<{ label: string; value: string; description?: string; recommended?: boolean }>;
+}
+
+export interface AskAnswer {
+  id: string;
+  value: string;
+  label?: string;
+}
+
+export interface PromptImage {
+  mimeType: string;
+  /** base64-encoded image bytes (no data: prefix). */
+  data: string;
+}
+
 export type HostMessage =
-  | { type: 'user'; text: string }
+  | { type: 'user'; text: string; images?: PromptImage[] }
   | { type: 'chunk'; text: string }
   | { type: 'thought'; text: string }
   | { type: 'tool'; tool: ToolCall }
@@ -43,13 +65,18 @@ export type HostMessage =
       toolKind?: string;
       options: PermissionOption[];
     }
-  | { type: 'permission_resolved'; id: string; optionId: string | null };
+  | { type: 'permission_resolved'; id: string; optionId: string | null }
+  | { type: 'question_request'; id: string; questions: AskQuestion[] }
+  | { type: 'question_resolved'; id: string }
+  | { type: 'file_results'; requestId: number; query: string; files: string[] };
 
 export type WebviewMessage =
-  | { type: 'prompt'; text: string }
+  | { type: 'prompt'; text: string; mentions?: string[]; images?: PromptImage[] }
   | { type: 'cancel' }
   | { type: 'restart' }
-  | { type: 'permission_response'; id: string; optionId: string | null };
+  | { type: 'search_files'; requestId: number; query: string }
+  | { type: 'permission_response'; id: string; optionId: string | null }
+  | { type: 'question_response'; id: string; answers: AskAnswer[] | null };
 
 export interface VsCodeApi {
   postMessage(msg: WebviewMessage): void;

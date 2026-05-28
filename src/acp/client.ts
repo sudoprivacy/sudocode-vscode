@@ -12,6 +12,8 @@ export interface ClientHost {
     toolKind?: string;
     options: Array<{ optionId: string; name: string; kind?: string }>;
   }): Promise<{ optionId: string | null }>;
+  /** Ask the user one or more questions inline. Resolve with answers, or null to cancel. */
+  onAskQuestions(questions: ScodeQuestion[]): Promise<{ answers: Array<{ id: string; value: string; label?: string }> | null }>;
 }
 
 interface ScodeQuestion {
@@ -126,44 +128,10 @@ export class SudocodeClient implements Client {
   async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (method === '_scode/ask_user_question') {
       const questions = (params.questions as ScodeQuestion[]) ?? [];
-      const answers: Array<{ id: string; value: string; label?: string }> = [];
-      for (const q of questions) {
-        const answer = await this.askOne(q);
-        if (answer) answers.push(answer);
-      }
-      return { answers };
+      if (questions.length === 0) return { answers: [] };
+      const { answers } = await this.host.onAskQuestions(questions);
+      return { answers: answers ?? [] };
     }
     return {};
-  }
-
-  private async askOne(q: ScodeQuestion): Promise<{ id: string; value: string; label?: string } | null> {
-    const hasOptions = Array.isArray(q.options) && q.options.length > 0;
-    const kind = q.kind ?? (hasOptions ? 'single_select' : 'text');
-
-    if (kind === 'text' || !hasOptions) {
-      const value = await vscode.window.showInputBox({
-        title: q.prompt,
-        placeHolder: q.customInputHint,
-        ignoreFocusOut: true,
-      });
-      if (value === undefined) return null;
-      return { id: q.id, value };
-    }
-
-    const items = q.options!.map((o) => ({
-      label: o.recommended ? `$(star-full) ${o.label}` : o.label,
-      description: o.description,
-      value: o.value,
-    }));
-    const picked = await vscode.window.showQuickPick(items, {
-      title: q.prompt,
-      canPickMany: kind === 'multi_select',
-      ignoreFocusOut: true,
-    });
-    if (!picked) return null;
-    if (Array.isArray(picked)) {
-      return { id: q.id, value: picked.map((p) => p.value).join(',') };
-    }
-    return { id: q.id, value: picked.value, label: picked.label };
   }
 }

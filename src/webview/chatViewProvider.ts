@@ -1,13 +1,24 @@
 import { readdirSync } from 'node:fs';
 import * as vscode from 'vscode';
 import type * as schema from '@agentclientprotocol/sdk';
-import { getWorkspaceCwd, SudocodeSession, type PermissionRequest } from '../acp/session';
+import {
+  getWorkspaceCwd,
+  SudocodeSession,
+  type AskAnswer,
+  type AskQuestion,
+  type PermissionRequest,
+  type PromptImage,
+} from '../acp/session';
 
 type AuthMode = 'auto' | 'subscription' | 'proxy' | 'api-key';
 type PermissionMode = 'default' | 'read-only' | 'workspace-write' | 'danger-full-access';
 
 interface PendingPermission {
   resolve(value: { optionId: string | null }): void;
+}
+
+interface PendingQuestion {
+  resolve(value: { answers: AskAnswer[] | null }): void;
 }
 
 /** Extract as much detail as possible from a thrown value (JSON-RPC errors carry code/data). */
@@ -47,6 +58,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private session?: SudocodeSession;
   private pendingPermissions = new Map<string, PendingPermission>();
   private permissionCounter = 0;
+  private pendingQuestions = new Map<string, PendingQuestion>();
+  private questionCounter = 0;
   private shownHints = new Set<string>();
 
   constructor(private readonly extensionUri: vscode.Uri) {}
@@ -60,9 +73,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.html = this.html(webviewView.webview);
 
     webviewView.webview.onDidReceiveMessage(
-      async (msg: { type: string; text?: string; id?: string; optionId?: string | null }) => {
-        if (msg.type === 'prompt' && msg.text) {
-          await this.handlePrompt(msg.text);
+      async (msg: {
+        type: string;
+        text?: string;
+        id?: string;
+        optionId?: string | null;
+        answers?: AskAnswer[] | null;
+        mentions?: string[];
+        images?: PromptImage[];
+        requestId?: number;
+        query?: string;
+      }) => {
+        if (msg.type === 'prompt' && msg.text !== undefined) {
+          await this.handlePrompt(msg.text, msg.mentions ?? [], msg.images ?? []);
         } else if (msg.type === 'cancel') {
           if (this.session) {
             this.post({ type: 'status', text: 'Cancel requested…' });
@@ -70,11 +93,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           }
         } else if (msg.type === 'restart') {
           await this.restart();
+        } else if (msg.type === 'search_files' && typeof msg.requestId === 'number') {
+          await this.searchFiles(msg.requestId, msg.query ?? '');
         } else if (msg.type === 'permission_response' && msg.id) {
           const pending = this.pendingPermissions.get(msg.id);
           if (pending) {
             this.pendingPermissions.delete(msg.id);
             pending.resolve({ optionId: msg.optionId ?? null });
+          }
+        } else if (msg.type === 'question_response' && msg.id) {
+          const pending = this.pendingQuestions.get(msg.id);
+          if (pending) {
+            this.pendingQuestions.delete(msg.id);
+            pending.resolve({ answers: msg.answers ?? null });
           }
         }
       },
@@ -130,6 +161,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           }
         },
         onRequestPermission: (req) => this.requestPermission(req),
+        onAskQuestions: (questions) => this.askQuestions(questions),
       },
       { cliPath: cfg.get<string>('cliPath') || undefined,
         authMode: cfg.get<AuthMode>('authMode') ?? 'auto',
@@ -143,17 +175,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return session;
   }
 
-  private async handlePrompt(text: string): Promise<void> {
-    this.post({ type: 'user', text });
+  private async handlePrompt(text: string, mentions: string[] = [], images: PromptImage[] = []): Promise<void> {
+    this.post({ type: 'user', text, images: images.length > 0 ? images : undefined });
     let phase = 'start';
     try {
       const session = await this.ensureSession();
       phase = 'prompt';
-      const result = await session.prompt(text);
+      if (images.length > 0 && !session.supportsImages) {
+        this.post({
+          type: 'status',
+          text: 'This agent did not advertise image support; pasted images were not sent.',
+        });
+      }
+      const result = await session.prompt(text, mentions, images);
       this.post({ type: 'done', text: result.stopReason });
     } catch (err) {
       this.post({ type: 'error', text: `[${phase}] ${describeError(err)}` });
     }
+  }
+
+  /** Fuzzy-ish file search for @-mentions. Returns workspace-relative paths. */
+  private async searchFiles(requestId: number, query: string): Promise<void> {
+    let files: string[] = [];
+    try {
+      const glob = query ? `**/*${query.replace(/[\\]/g, '/')}*` : '**/*';
+      const uris = await vscode.workspace.findFiles(glob, '**/{node_modules,.git,dist,out}/**', 30);
+      files = uris.map((u) => vscode.workspace.asRelativePath(u, false)).sort((a, b) => a.length - b.length);
+    } catch {
+      files = [];
+    }
+    this.post({ type: 'file_results', requestId, query, files });
   }
 
   private handleUpdate(params: schema.SessionNotification): void {
@@ -225,6 +276,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       p.resolve({ optionId });
     }
     this.pendingPermissions.clear();
+    for (const [id, p] of this.pendingQuestions) {
+      this.post({ type: 'question_resolved', id });
+      p.resolve({ answers: null });
+    }
+    this.pendingQuestions.clear();
+  }
+
+  private askQuestions(questions: AskQuestion[]): Promise<{ answers: AskAnswer[] | null }> {
+    this.view?.show?.(true);
+    const id = `q${++this.questionCounter}`;
+    return new Promise<{ answers: AskAnswer[] | null }>((resolve) => {
+      this.pendingQuestions.set(id, { resolve });
+      this.post({ type: 'question_request', id, questions });
+    });
   }
 
   /**

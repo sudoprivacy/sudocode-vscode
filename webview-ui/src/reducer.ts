@@ -1,7 +1,7 @@
-import type { HostMessage, PermissionOption, PlanEntry, ToolCall } from './protocol';
+import type { AskQuestion, HostMessage, PermissionOption, PlanEntry, PromptImage, ToolCall } from './protocol';
 
 export type Item =
-  | { kind: 'user'; id: string; text: string }
+  | { kind: 'user'; id: string; text: string; images?: PromptImage[] }
   | { kind: 'agent'; id: string; text: string }
   | { kind: 'thought'; id: string; text: string }
   | { kind: 'tool'; id: string; tool: ToolCall }
@@ -18,6 +18,13 @@ export type Item =
       toolKind?: string;
       options: PermissionOption[];
       resolvedOptionId?: string | null;
+    }
+  | {
+      kind: 'question';
+      id: string;
+      requestId: string;
+      questions: AskQuestion[];
+      resolved?: boolean;
     };
 
 let counter = 0;
@@ -46,7 +53,7 @@ export function reduce(items: Item[], msg: HostMessage): Item[] {
     case 'reset':
       return [];
     case 'user':
-      return [...items, { kind: 'user', id: newId(), text: msg.text }];
+      return [...items, { kind: 'user', id: newId(), text: msg.text, images: msg.images }];
     case 'chunk': {
       const last = items[items.length - 1];
       if (last && last.kind === 'agent') {
@@ -112,6 +119,25 @@ export function reduce(items: Item[], msg: HostMessage): Item[] {
       if (current.resolvedOptionId !== undefined) return items;
       const next = items.slice();
       next[idx] = { ...current, resolvedOptionId: msg.optionId };
+      return next;
+    }
+    case 'question_request':
+      return [
+        ...items,
+        {
+          kind: 'question',
+          id: newId(),
+          requestId: msg.id,
+          questions: msg.questions,
+        },
+      ];
+    case 'question_resolved': {
+      const idx = items.findIndex((i) => i.kind === 'question' && i.requestId === msg.id);
+      if (idx < 0) return items;
+      const current = items[idx] as Extract<Item, { kind: 'question' }>;
+      if (current.resolved) return items;
+      const next = items.slice();
+      next[idx] = { ...current, resolved: true };
       return next;
     }
     default:

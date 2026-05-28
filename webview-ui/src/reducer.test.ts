@@ -88,6 +88,30 @@ describe('reduce', () => {
     expect(perm.resolvedOptionId).toBe('allow_once');
   });
 
+  it('resolves a question once', () => {
+    const items = fold([
+      {
+        type: 'question_request',
+        id: 'q1',
+        questions: [{ id: 'a', prompt: 'Pick one', kind: 'single_select', options: [{ label: 'X', value: 'x' }] }],
+      },
+      { type: 'question_resolved', id: 'q1' },
+      { type: 'question_resolved', id: 'q1' },
+    ]);
+    expect(items).toHaveLength(1);
+    const q = items[0] as Extract<Item, { kind: 'question' }>;
+    expect(q.kind).toBe('question');
+    expect(q.resolved).toBe(true);
+  });
+
+  it('keeps pasted images on the user item', () => {
+    const items = fold([
+      { type: 'user', text: 'look', images: [{ mimeType: 'image/png', data: 'AAAA' }] },
+    ]);
+    const u = items[0] as Extract<Item, { kind: 'user' }>;
+    expect(u.images).toEqual([{ mimeType: 'image/png', data: 'AAAA' }]);
+  });
+
   it('bumpIdCounter avoids id collisions after restore', () => {
     const restored: Item[] = [{ kind: 'user', id: 'i42', text: 'old' }];
     bumpIdCounter(restored);

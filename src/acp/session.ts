@@ -1,4 +1,6 @@
 import { Readable, Writable } from 'node:stream';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import * as vscode from 'vscode';
 import * as acp from '@agentclientprotocol/sdk';
 import type * as schema from '@agentclientprotocol/sdk';
@@ -11,12 +13,36 @@ export interface PermissionRequest {
   options: Array<{ optionId: string; name: string; kind?: string }>;
 }
 
+export interface AskQuestion {
+  id: string;
+  prompt: string;
+  kind?: 'single_select' | 'multi_select' | 'text' | 'boolean';
+  required?: boolean;
+  allowCustomInput?: boolean;
+  customInputHint?: string;
+  options?: Array<{ label: string; value: string; description?: string; recommended?: boolean }>;
+}
+
+export interface AskAnswer {
+  id: string;
+  value: string;
+  label?: string;
+}
+
+export interface PromptImage {
+  mimeType: string;
+  /** base64-encoded image bytes (no data: prefix). */
+  data: string;
+}
+
 export interface SessionEvents {
   onUpdate(update: schema.SessionNotification): void;
   onExit(info: { code: number | null; signal: NodeJS.Signals | null }): void;
   onStderr(line: string): void;
   /** Resolve with the chosen optionId, or null to cancel/reject. */
   onRequestPermission(req: PermissionRequest): Promise<{ optionId: string | null }>;
+  /** Ask the user one or more questions inline. Resolve with answers, or null to cancel. */
+  onAskQuestions(questions: AskQuestion[]): Promise<{ answers: AskAnswer[] | null }>;
 }
 
 /** One scode ACP process + connection + session, tied to a workspace folder. */
@@ -26,6 +52,7 @@ export class SudocodeSession {
   private client?: SudocodeClient;
   private sessionId?: string;
   private disposed = false;
+  private imageSupported = false;
 
   constructor(
     private readonly cwd: string,
@@ -66,6 +93,7 @@ export class SudocodeSession {
     const client = new SudocodeClient({
       onSessionUpdate: (u) => this.events.onUpdate(u),
       onRequestPermission: (req) => this.events.onRequestPermission(req),
+      onAskQuestions: (questions) => this.events.onAskQuestions(questions),
     });
     this.client = client;
 
@@ -77,7 +105,7 @@ export class SudocodeSession {
     const connection = new acp.ClientSideConnection(() => client, stream);
     this.connection = connection;
 
-    await connection.initialize({
+    const init = await connection.initialize({
       protocolVersion: acp.PROTOCOL_VERSION,
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: true },
@@ -86,17 +114,36 @@ export class SudocodeSession {
         // the client-side methods remain in the codebase for future agents.
       },
     });
+    this.imageSupported = init.agentCapabilities?.promptCapabilities?.image === true;
 
     const session = await connection.newSession({ cwd: this.cwd, mcpServers: [] });
     this.sessionId = session.sessionId;
   }
 
-  async prompt(text: string): Promise<schema.PromptResponse> {
+  /** True if the agent advertised support for image content blocks at initialize. */
+  get supportsImages(): boolean {
+    return this.imageSupported;
+  }
+
+  async prompt(text: string, mentions: string[] = [], images: PromptImage[] = []): Promise<schema.PromptResponse> {
     if (!this.connection || !this.sessionId) throw new Error('Session not started');
-    return this.connection.prompt({
-      sessionId: this.sessionId,
-      prompt: [{ type: 'text', text }],
-    });
+    const prompt: schema.ContentBlock[] = [];
+    if (text) prompt.push({ type: 'text', text });
+    for (const rel of mentions) {
+      const abs = path.isAbsolute(rel) ? rel : path.join(this.cwd, rel);
+      prompt.push({
+        type: 'resource_link',
+        uri: pathToFileURL(abs).toString(),
+        name: rel,
+      });
+    }
+    if (this.imageSupported) {
+      for (const img of images) {
+        prompt.push({ type: 'image', data: img.data, mimeType: img.mimeType });
+      }
+    }
+    if (prompt.length === 0) prompt.push({ type: 'text', text: '' });
+    return this.connection.prompt({ sessionId: this.sessionId, prompt });
   }
 
   async cancel(): Promise<void> {
