@@ -68,6 +68,7 @@ export type HostMessage =
   | { type: 'stderr'; text: string }
   | { type: 'error'; text: string }
   | { type: 'done'; text: string }
+  | { type: 'interrupted'; text: string }
   | { type: 'reset' }
   | { type: 'prefill'; text: string }
   | {
@@ -83,6 +84,7 @@ export type HostMessage =
   | { type: 'file_results'; requestId: number; query: string; files: string[] };
 
 export type WebviewMessage =
+  | { type: 'ready' }
   | { type: 'prompt'; text: string; mentions?: string[]; images?: PromptImage[] }
   | { type: 'cancel' }
   | { type: 'restart' }

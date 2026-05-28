@@ -73,6 +73,20 @@ describe('reduce', () => {
     expect((items[0] as Extract<Item, { kind: 'tool' }>).tool.title).toBe('real');
   });
 
+  it('appends an interrupted notice after a half-streamed agent bubble', () => {
+    const items = fold([
+      { type: 'user', text: 'q' },
+      { type: 'chunk', text: 'partial ' },
+      { type: 'chunk', text: 'answer' },
+      { type: 'interrupted', text: 'The view reloaded; the message above may be incomplete.' },
+    ]);
+    expect(items.map((i) => i.kind)).toEqual(['user', 'agent', 'interrupted']);
+    expect((items[1] as Extract<Item, { kind: 'agent' }>).text).toBe('partial answer');
+    const notice = items[2] as Extract<Item, { kind: 'interrupted' }>;
+    expect(notice.kind).toBe('interrupted');
+    expect(notice.text).toContain('may be incomplete');
+  });
+
   it('resolves a permission once', () => {
     const items = fold([
       {

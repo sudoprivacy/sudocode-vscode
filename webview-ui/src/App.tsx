@@ -74,6 +74,13 @@ export function App(): React.ReactElement {
     vscode.setState<PersistedState>({ itemsByFolder, inputByFolder, activeFolder });
   }, [itemsByFolder, inputByFolder, activeFolder]);
 
+  // Announce that a (possibly fresh) webview is live. The host replies with
+  // `interrupted` notices for any folder whose turn was streaming when this
+  // webview was disposed/recreated (e.g. the sidebar was hidden then reshown).
+  useEffect(() => {
+    vscode.postMessage({ type: 'ready' });
+  }, []);
+
   function applyToFolder(folder: string, msg: HostMessage) {
     setItemsByFolder((prev) => ({ ...prev, [folder]: reduce(prev[folder] ?? [], msg) }));
   }
@@ -338,6 +345,12 @@ function renderItem(
       return (
         <div key={item.id} className="item done">
           ({item.text})
+        </div>
+      );
+    case 'interrupted':
+      return (
+        <div key={item.id} className="item interrupted">
+          ⚠ {item.text}
         </div>
       );
     case 'permission': {

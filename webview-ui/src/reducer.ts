@@ -10,6 +10,7 @@ export type Item =
   | { kind: 'stderr'; id: string; text: string }
   | { kind: 'error'; id: string; text: string }
   | { kind: 'done'; id: string; text: string }
+  | { kind: 'interrupted'; id: string; text: string }
   | {
       kind: 'permission';
       id: string;
@@ -100,6 +101,8 @@ export function reduce(items: Item[], msg: HostMessage): Item[] {
       return [...items, { kind: 'error', id: newId(), text: msg.text }];
     case 'done':
       return [...items, { kind: 'done', id: newId(), text: msg.text }];
+    case 'interrupted':
+      return [...items, { kind: 'interrupted', id: newId(), text: msg.text }];
     case 'permission_request':
       return [
         ...items,

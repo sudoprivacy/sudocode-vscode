@@ -59,12 +59,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private view?: vscode.WebviewView;
   private sessions = new Map<string, SudocodeSession>();
+  /** Folders with an in-flight cancel: scode may keep streaming updates briefly after
+   * cancel is requested but before prompt() resolves; we drop those so the UI stops growing. */
+  private cancelling = new Set<string>();
   private activeFolder?: string;
   private pendingPermissions = new Map<string, PendingPermission>();
   private permissionCounter = 0;
   private pendingQuestions = new Map<string, PendingQuestion>();
   private questionCounter = 0;
   private shownHints = new Set<string>();
+  /** Folders with a prompt turn currently awaiting `session.prompt(...)`. */
+  private inFlightPrompts = new Set<string>();
   private disposables: vscode.Disposable[] = [];
 
   constructor(private readonly extensionUri: vscode.Uri) {}
@@ -92,9 +97,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }) => {
         if (msg.type === 'prompt' && msg.text !== undefined) {
           await this.handlePrompt(msg.text, msg.mentions ?? [], msg.images ?? []);
+        } else if (msg.type === 'ready') {
+          // A (possibly recreated) webview just mounted. If any folder had a
+          // prompt turn streaming when the previous webview was disposed, tell
+          // the user the visible bubble for that folder may be truncated.
+          for (const folder of this.inFlightPrompts) {
+            this.post({
+              type: 'interrupted',
+              text: 'The view reloaded while the agent was responding; the message above may be incomplete. New output will continue to stream here.',
+            }, folder);
+          }
         } else if (msg.type === 'cancel') {
           const session = this.activeFolder ? this.sessions.get(this.activeFolder) : undefined;
-          if (session) {
+          if (session && this.activeFolder) {
+            this.cancelling.add(this.activeFolder);
             this.post({ type: 'status', text: 'Cancel requested…' }, this.activeFolder);
             await session.cancel();
           }
@@ -180,7 +196,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       {
         onUpdate: (u) => this.handleUpdate(folder, u),
         onExit: ({ code, signal }) => {
+          this.cancelling.delete(folder);
           this.resolveAllPending(null, folder);
+          this.inFlightPrompts.delete(folder);
           this.post({ type: 'status', text: `Agent exited (code=${code}, signal=${signal}).` }, folder);
           this.sessions.delete(folder);
         },
@@ -218,7 +236,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     this.post({ type: 'user', text, images: images.length > 0 ? images : undefined }, folder);
+    // A fresh prompt should never start while a stale cancel is being suppressed.
+    this.cancelling.delete(folder);
     let phase = 'start';
+    this.inFlightPrompts.add(folder);
     try {
       const session = await this.ensureSession(folder);
       phase = 'prompt';
@@ -232,6 +253,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.post({ type: 'done', text: result.stopReason }, folder);
     } catch (err) {
       this.post({ type: 'error', text: `[${phase}] ${describeError(err)}` }, folder);
+    } finally {
+      this.cancelling.delete(folder);
+      this.inFlightPrompts.delete(folder);
     }
   }
 
@@ -254,6 +278,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private handleUpdate(folder: string, params: schema.SessionNotification): void {
     const update = params.update;
+    // After cancel is requested, suppress the trailing burst of streaming updates.
+    if (this.cancelling.has(folder)) {
+      switch (update.sessionUpdate) {
+        case 'agent_message_chunk':
+        case 'agent_thought_chunk':
+        case 'tool_call':
+        case 'tool_call_update':
+        case 'plan':
+          return;
+        default:
+          break;
+      }
+    }
     switch (update.sessionUpdate) {
       case 'agent_message_chunk':
         if (update.content.type === 'text') this.post({ type: 'chunk', text: update.content.text }, folder);
